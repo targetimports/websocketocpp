@@ -1,6 +1,6 @@
-import http from "http";
+import http from "node:http";
+import crypto from "node:crypto";
 import { WebSocketServer } from "ws";
-import crypto from "crypto";
 
 process.on("uncaughtException", (err) => {
   console.error("UNCAUGHT EXCEPTION:", err);
