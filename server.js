@@ -408,4 +408,4 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`OCPP Gateway rodando na porta ${PORT}`);
   console.log(`Healthcheck: /monitor`);
 });
-```
+
