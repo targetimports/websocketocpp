@@ -1,47 +1,50 @@
-import { WebSocketServer } from 'ws';
+import http from "http";
+import { WebSocketServer } from "ws";
 
 const PORT = process.env.PORT || 3000;
 
-const wss = new WebSocketServer({ port: PORT });
+// 1) Servidor HTTP (para /monitor e qualquer rota simples)
+const server = http.createServer((req, res) => {
+  if (req.url === "/monitor") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: true, ts: new Date().toISOString() }));
+  }
 
-console.log(`WebSocket OCPP rodando na porta ${PORT}`);
+  // opcional: resposta padrão
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("OK");
+});
 
-wss.on('connection', (ws, req) => {
-  // Ex: ws://host:3000/CP_123456
-  const serialNumber = req.url?.replace('/', '') || 'UNKNOWN';
+// 2) WebSocket acoplado ao mesmo server (upgrade)
+const wss = new WebSocketServer({ server });
 
-  console.log('Conectado:', serialNumber);
+wss.on("connection", (ws, req) => {
+  const serialNumber = req.url?.replace("/", "") || "UNKNOWN";
+  console.log("WS conectado:", serialNumber);
 
-  ws.on('message', async (data) => {
+  ws.on("message", async (data) => {
     try {
       const message = JSON.parse(data.toString());
 
-      console.log('Mensagem recebida:', serialNumber, message);
+      await fetch("https://targetecomobi.base44.app/api/functions/processOcppMessage", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ serialNumber, message }),
+      });
 
-      await fetch(
-        'https://targetecomobi.base44.app/api/functions/processOcppMessage',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            serialNumber,
-            message
-          })
-        }
-      );
-
+      // ⚠️ OCPP costuma exigir resposta (dependendo da mensagem)
+      // Aqui é só exemplo; o ideal é responder conforme o tipo [2, id, action, payload]
+      // ws.send(JSON.stringify([3, message[1], {}]));
     } catch (err) {
-      console.error('Erro ao processar mensagem:', err);
+      console.error("Erro ao processar mensagem:", err);
     }
   });
 
-  ws.on('close', () => {
-    console.log('Desconectado:', serialNumber);
-  });
+  ws.on("close", () => console.log("WS desconectado:", serialNumber));
+  ws.on("error", (err) => console.error("WS erro:", serialNumber, err));
+});
 
-  ws.on('error', (err) => {
-    console.error('Erro WS:', serialNumber, err);
-  });
+// 3) Escuta exatamente no PORT do Railway
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`HTTP+WS rodando na porta ${PORT}`);
 });
