@@ -1,15 +1,18 @@
 import http from "node:http";
-import crypto from "node:crypto";
 import { WebSocketServer } from "ws";
 
-
-server.listen(PORT, "0.0.0.0");
+process.on("uncaughtException", (err) => console.error("UNCAUGHT EXCEPTION:", err));
+process.on("unhandledRejection", (err) => console.error("UNHANDLED REJECTION:", err));
 
 const PORT = process.env.PORT || 3000;
 
 const BASE44_URL =
-  Deno.env.get("BASE44_URL") ??
+  process.env.BASE44_URL ||
   "https://targetecomobi.base44.app/api/functions/processOcppMessage";
+
+const BASE44_TIMEOUT_MS = Number(process.env.BASE44_TIMEOUT_MS || 8000);
+const REQUIRE_OCPP_SUBPROTOCOL =
+  String(process.env.REQUIRE_OCPP_SUBPROTOCOL || "false") === "true";
 
 const OCPP = { CALL: 2, CALLRESULT: 3, CALLERROR: 4 };
 
@@ -40,45 +43,62 @@ function buildCallResult(action) {
 }
 
 async function forwardToBase44({ chargePointId, raw, ocppType, messageId, action, payload }) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), BASE44_TIMEOUT_MS);
+
   try {
-    await fetch(BASE44_URL, {
+    const res = await fetch(BASE44_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
       body: JSON.stringify({
         chargePointId,
         ocpp: { ocppType, messageId, action, payload, raw, receivedAt: nowIso() },
       }),
     });
+
+    if (!res.ok) {
+      console.warn("[Base44] status:", res.status);
+    }
   } catch (e) {
     console.warn("[Base44] erro:", String(e?.message || e));
+  } finally {
+    clearTimeout(t);
   }
 }
 
-Deno.serve({ port: PORT, hostname: "0.0.0.0" }, (req) => {
-  const url = new URL(req.url);
-
-  if (url.pathname === "/monitor") {
-    return new Response(JSON.stringify({ ok: true, ts: nowIso() }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
+// 1) HTTP server (Railway precisa disso pra healthcheck e roteamento)
+const server = http.createServer((req, res) => {
+  if (req.url === "/monitor") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: true, ts: nowIso() }));
   }
 
-  const upgrade = req.headers.get("upgrade") || "";
-  if (upgrade.toLowerCase() !== "websocket") {
-    return new Response("OCPP 1.6J Gateway (Deno) OK", { status: 200 });
-  }
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("OCPP 1.6J Gateway (Node) OK");
+});
 
-  const { socket, response } = Deno.upgradeWebSocket(req);
-  const chargePointId = (url.pathname || "/").replace("/", "") || "UNKNOWN";
+// 2) WebSocket em cima do MESMO server/porta
+const wss = new WebSocketServer({
+  server,
+  handleProtocols: (protocols) => {
+    const list = protocols instanceof Set ? [...protocols] : protocols || [];
+    if (list.includes("ocpp1.6")) return "ocpp1.6";
+    if (!REQUIRE_OCPP_SUBPROTOCOL && list.length) return list[0];
+    return undefined; // não retorne false
+  },
+});
+
+wss.on("connection", (ws, req) => {
+  const chargePointId = (req.url || "/").replace("/", "") || "UNKNOWN";
   console.log("[WS] conectado:", chargePointId);
 
-  socket.onmessage = (event) => {
+  ws.on("message", (data) => {
     let msg;
     try {
-      msg = JSON.parse(event.data);
+      msg = JSON.parse(data.toString());
     } catch {
-      console.warn("[WS] JSON inválido:", event.data);
+      console.warn("[WS] JSON inválido:", data.toString());
       return;
     }
 
@@ -89,6 +109,7 @@ Deno.serve({ port: PORT, hostname: "0.0.0.0" }, (req) => {
 
     const messageTypeId = msg[0];
 
+    // CALL
     if (messageTypeId === OCPP.CALL) {
       const messageId = msg[1];
       const action = msg[2];
@@ -96,9 +117,9 @@ Deno.serve({ port: PORT, hostname: "0.0.0.0" }, (req) => {
 
       // responder rápido
       const respPayload = buildCallResult(action);
-      socket.send(JSON.stringify([OCPP.CALLRESULT, messageId, respPayload]));
+      ws.send(JSON.stringify([OCPP.CALLRESULT, messageId, respPayload]));
 
-      // enviar base44
+      // enviar para Base44 sem travar
       forwardToBase44({
         chargePointId,
         raw: msg,
@@ -107,9 +128,11 @@ Deno.serve({ port: PORT, hostname: "0.0.0.0" }, (req) => {
         action,
         payload,
       });
+
       return;
     }
 
+    // CALLRESULT
     if (messageTypeId === OCPP.CALLRESULT) {
       forwardToBase44({
         chargePointId,
@@ -122,6 +145,7 @@ Deno.serve({ port: PORT, hostname: "0.0.0.0" }, (req) => {
       return;
     }
 
+    // CALLERROR
     if (messageTypeId === OCPP.CALLERROR) {
       forwardToBase44({
         chargePointId,
@@ -137,7 +161,15 @@ Deno.serve({ port: PORT, hostname: "0.0.0.0" }, (req) => {
       });
       return;
     }
-  };
 
-  return response;
+    console.warn("[WS] MessageTypeId desconhecido:", msg);
+  });
+
+  ws.on("close", () => console.log("[WS] desconectado:", chargePointId));
+  ws.on("error", (err) => console.warn("[WS] erro:", chargePointId, err));
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`HTTP+WS OCPP 1.6J rodando na porta ${PORT}`);
+  console.log("Healthcheck: /monitor");
 });
