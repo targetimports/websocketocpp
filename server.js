@@ -1,9 +1,15 @@
 /**
- * server.js — OCPP 1.6J Gateway (WS + HTTP)
- * - Responde IMEDIATO (CALLRESULT) para ações comuns do CP (Boot/Heartbeat/Authorize/Start/Stop/Meter/DataTransfer)
- * - Envia CALLERROR NotImplemented para ações desconhecidas (em vez de retornar payload vazio inválido)
- * - Loga protocolo NEGOCIADO (ws.protocol) e o header recebido
- * - Mantém rotas HTTP: /monitor, /ocpp/clients, /ocpp/send
+ * server.js — OCPP 1.6J Gateway (WS + HTTP) com:
+ * - Respostas imediatas (CALLRESULT) para ações comuns (Boot/Heartbeat/Authorize/Start/Stop/Meter/DataTransfer)
+ * - CALLERROR NotImplemented para ações desconhecidas (evita payload inválido)
+ * - Fila de comandos "logo ao conectar" (enfileira no connect e dispara após BootNotification Accepted)
+ * - perMessageDeflate desativado (compatibilidade)
+ * - TCP keep-alive e ping opcional (para evitar timeout de proxy/LB)
+ *
+ * Rotas HTTP:
+ *  GET  /monitor
+ *  GET  /ocpp/clients
+ *  POST /ocpp/send   (envia CALL do servidor -> carregador)
  *
  * ENV:
  *  PORT=3000
@@ -11,8 +17,26 @@
  *  API_KEY=...
  *  BOOT_INTERVAL_SEC=30
  *  BASE44_HEARTBEAT_SEC=30
+ *
  *  ENABLE_PING=false
- *  PING_INTERVAL_MS=25000
+ *  PING_INTERVAL_MS=20000
+ *  TCP_KEEPALIVE_MS=15000
+ *
+ *  // comandos automáticos ao conectar (disparam após BootNotification)
+ *  AUTO_TRIGGER_STATUS=true
+ *  AUTO_TRIGGER_METER=false
+ *  AUTO_TRIGGER_CONNECTOR_ID=1
+ *  AUTO_DATATRANSFER=false
+ *  AUTO_VENDOR_ID=SeuVendor
+ *  AUTO_MESSAGE_ID=Hello
+ *  AUTO_DATA=ping
+ *
+ *  // reserva automática (opcional)
+ *  AUTO_RESERVE=false
+ *  AUTO_RESERVE_CONNECTOR_ID=1
+ *  AUTO_RESERVE_IDTAG=ABC123
+ *  AUTO_RESERVE_MINUTES=30
+ *  AUTO_RESERVE_RESERVATION_ID=101
  */
 
 import http from "node:http";
@@ -22,33 +46,43 @@ const PORT = Number(process.env.PORT || 3000);
 const BASE44_URL =
   process.env.BASE44_URL ||
   "https://targetecomobi.base44.app/api/functions/processOcppMessage";
-
 const API_KEY = process.env.API_KEY || "";
 
-// Intervalo devolvido no BootNotificationResponse (CP manda Heartbeat baseado nisso)
 const BOOT_INTERVAL_SEC = Number(process.env.BOOT_INTERVAL_SEC || 30);
-
-// Heartbeat “interno” pro Base44 (apenas para manter last_heartbeat no seu banco)
 const BASE44_HEARTBEAT_SEC = Number(process.env.BASE44_HEARTBEAT_SEC || 30);
 
-// ⚠️ Alguns CPs derrubam se o servidor enviar ping.
-// Deixe false por padrão. Se necessário, ENABLE_PING=true
 const ENABLE_PING = String(process.env.ENABLE_PING || "false") === "true";
-const PING_INTERVAL_MS = Number(process.env.PING_INTERVAL_MS || 25000);
+const PING_INTERVAL_MS = Number(process.env.PING_INTERVAL_MS || 20000);
+const TCP_KEEPALIVE_MS = Number(process.env.TCP_KEEPALIVE_MS || 15000);
+
+// auto-commands
+const AUTO_TRIGGER_STATUS = String(process.env.AUTO_TRIGGER_STATUS || "true") === "true";
+const AUTO_TRIGGER_METER = String(process.env.AUTO_TRIGGER_METER || "false") === "true";
+const AUTO_TRIGGER_CONNECTOR_ID = Number(process.env.AUTO_TRIGGER_CONNECTOR_ID || 1);
+
+const AUTO_DATATRANSFER = String(process.env.AUTO_DATATRANSFER || "false") === "true";
+const AUTO_VENDOR_ID = String(process.env.AUTO_VENDOR_ID || "SeuVendor");
+const AUTO_MESSAGE_ID = String(process.env.AUTO_MESSAGE_ID || "Hello");
+const AUTO_DATA = String(process.env.AUTO_DATA || "ping");
+
+const AUTO_RESERVE = String(process.env.AUTO_RESERVE || "false") === "true";
+const AUTO_RESERVE_CONNECTOR_ID = Number(process.env.AUTO_RESERVE_CONNECTOR_ID || 1);
+const AUTO_RESERVE_IDTAG = String(process.env.AUTO_RESERVE_IDTAG || "ABC123");
+const AUTO_RESERVE_MINUTES = Number(process.env.AUTO_RESERVE_MINUTES || 30);
+const AUTO_RESERVE_RESERVATION_ID = Number(process.env.AUTO_RESERVE_RESERVATION_ID || 101);
 
 const OCPP = { CALL: 2, CALLRESULT: 3, CALLERROR: 4 };
 
-const clients = new Map(); // serial -> ws
-const base44Timers = new Map(); // serial -> interval
+const clients = new Map();           // serial -> ws
+const base44Timers = new Map();       // serial -> interval
+const pendingCommands = new Map();    // serial -> array of {action, payload}
 
 function nowIso() {
   return new Date().toISOString();
 }
-
 function uid() {
   return Math.random().toString(16).slice(2) + Date.now().toString(16);
 }
-
 function readBody(req) {
   return new Promise((resolve) => {
     let data = "";
@@ -94,52 +128,35 @@ function msgHeartbeat() {
 }
 
 /**
- * Respostas mínimas VÁLIDAS OCPP 1.6J (CALLRESULT payload)
- * Retorne:
+ * Respostas mínimas VÁLIDAS (CALLRESULT payload) — OCPP 1.6J
+ * Retorna:
  *  - objeto => CALLRESULT
- *  - null => CALLERROR NotImplemented (melhor que {} inválido)
+ *  - null   => CALLERROR NotImplemented
  */
 function buildImmediateCallResult(action, payload) {
   switch (action) {
     case "BootNotification":
-      return {
-        status: "Accepted",
-        currentTime: nowIso(),
-        interval: BOOT_INTERVAL_SEC,
-      };
-
+      return { status: "Accepted", currentTime: nowIso(), interval: BOOT_INTERVAL_SEC };
     case "Heartbeat":
       return { currentTime: nowIso() };
-
     case "StatusNotification":
       return {}; // ok vazio
-
     case "Authorize":
-      // obrigatório: idTagInfo
       return { idTagInfo: { status: "Accepted" } };
-
     case "StartTransaction":
-      // obrigatório: transactionId e idTagInfo
       return {
         transactionId: Math.floor(Date.now() / 1000),
         idTagInfo: { status: "Accepted" },
       };
-
     case "StopTransaction":
-      // obrigatório: idTagInfo
       return { idTagInfo: { status: "Accepted" } };
-
     case "MeterValues":
       return {}; // ok vazio
-
     case "DataTransfer":
-      // obrigatório: status
       return { status: "Accepted", data: "" };
-
     case "DiagnosticsStatusNotification":
     case "FirmwareStatusNotification":
       return {}; // ok vazio
-
     default:
       return null;
   }
@@ -150,9 +167,64 @@ function safeSend(ws, arr) {
   try {
     ws.send(JSON.stringify(arr));
     return true;
-  } catch (e) {
+  } catch {
     return false;
   }
+}
+
+function enqueueAutoCommands(serialNumber) {
+  const q = [];
+
+  if (AUTO_TRIGGER_STATUS) {
+    q.push({
+      action: "TriggerMessage",
+      payload: { requestedMessage: "StatusNotification", connectorId: AUTO_TRIGGER_CONNECTOR_ID },
+    });
+  }
+  if (AUTO_TRIGGER_METER) {
+    q.push({
+      action: "TriggerMessage",
+      payload: { requestedMessage: "MeterValues", connectorId: AUTO_TRIGGER_CONNECTOR_ID },
+    });
+  }
+  if (AUTO_DATATRANSFER) {
+    q.push({
+      action: "DataTransfer",
+      payload: { vendorId: AUTO_VENDOR_ID, messageId: AUTO_MESSAGE_ID, data: AUTO_DATA },
+    });
+  }
+  if (AUTO_RESERVE) {
+    const expiry = new Date(Date.now() + AUTO_RESERVE_MINUTES * 60 * 1000).toISOString();
+    q.push({
+      action: "ReserveNow",
+      payload: {
+        connectorId: AUTO_RESERVE_CONNECTOR_ID,
+        expiryDate: expiry,
+        idTag: AUTO_RESERVE_IDTAG,
+        reservationId: AUTO_RESERVE_RESERVATION_ID,
+      },
+    });
+  }
+
+  pendingCommands.set(serialNumber, q);
+}
+
+function flushPendingCommands(serialNumber, ws) {
+  const q = pendingCommands.get(serialNumber) || [];
+  if (!q.length) return;
+
+  for (const cmd of q) {
+    const messageId = uid();
+    const ok = safeSend(ws, [OCPP.CALL, messageId, cmd.action, cmd.payload || {}]);
+    if (ok) {
+      console.log(`[OCPP OUT] ${serialNumber} CALL ${cmd.action} id=${messageId}`);
+    } else {
+      console.warn(`[OCPP OUT] ${serialNumber} falha ao enviar ${cmd.action}`);
+      break;
+    }
+  }
+
+  pendingCommands.set(serialNumber, []);
 }
 
 // ========= HTTP =========
@@ -165,14 +237,12 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && req.url === "/ocpp/clients") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(
-      JSON.stringify({
-        ok: true,
-        clients: [...clients.keys()],
-        count: clients.size,
-        ts: nowIso(),
-      })
-    );
+    return res.end(JSON.stringify({
+      ok: true,
+      clients: [...clients.keys()],
+      count: clients.size,
+      ts: nowIso(),
+    }));
   }
 
   if (req.method === "POST" && req.url === "/ocpp/send") {
@@ -182,12 +252,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     let json;
-    try {
-      json = JSON.parse(await readBody(req));
-    } catch {
-      res.writeHead(400);
-      return res.end("invalid json");
-    }
+    try { json = JSON.parse(await readBody(req)); }
+    catch { res.writeHead(400); return res.end("invalid json"); }
 
     const { serialNumber, action, payload } = json || {};
     const ws = clients.get(serialNumber);
@@ -198,11 +264,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     const messageId = uid();
-    // CSMS -> CP (CALL)
-    safeSend(ws, [OCPP.CALL, messageId, action, payload || {}]);
+    const ok = safeSend(ws, [OCPP.CALL, messageId, action, payload || {}]);
 
-    res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ ok: true, messageId }));
+    res.writeHead(ok ? 200 : 500, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok, messageId }));
   }
 
   res.writeHead(404);
@@ -213,11 +278,7 @@ const server = http.createServer(async (req, res) => {
 
 const wss = new WebSocketServer({
   server,
-  /**
-   * OCPP 1.6J normalmente exige subprotocol "ocpp1.6"
-   * - se o client oferecer "ocpp1.6", aceitamos.
-   * - se não oferecer, aceitamos undefined (sem subprotocol), mas muitos CPs não gostam.
-   */
+  perMessageDeflate: false,
   handleProtocols: (protocols) => {
     const list = protocols instanceof Set ? [...protocols] : protocols || [];
     if (list.includes("ocpp1.6")) return "ocpp1.6";
@@ -226,50 +287,43 @@ const wss = new WebSocketServer({
 });
 
 wss.on("connection", (ws, req) => {
-  // Extrai o último segmento do path (serve /ocpp/2222 e /2222)
   const u = new URL(req.url || "/", "http://local");
   const parts = u.pathname.split("/").filter(Boolean);
   const serialNumber = (parts.pop() || "").trim() || "UNKNOWN";
 
   const protoHeader = String(req.headers["sec-websocket-protocol"] || "");
-  const negotiated = String(ws.protocol || ""); // ✅ o que realmente foi negociado
+  const negotiated = String(ws.protocol || "");
 
-  console.log(
-    `[WS] conectado ${serialNumber} | negotiated="${negotiated}" | header="${protoHeader}" | path="${u.pathname}" | ${nowIso()}`
-  );
+  console.log(`[WS] conectado ${serialNumber} | negotiated="${negotiated}" | header="${protoHeader}" | path="${u.pathname}" | ${nowIso()}`);
 
-  // Rejeita conexões “estranhas”
   if (serialNumber === "UNKNOWN" || serialNumber === "monitor") {
-    try {
-      ws.close(1008, "Invalid path");
-    } catch {}
+    try { ws.close(1008, "Invalid path"); } catch {}
     return;
   }
 
-  // Se você quiser ser MAIS rígido (recomendado em produção):
-  // Se o CP não negociar "ocpp1.6", encerra.
+  // Exigir subprotocol em produção:
   if (negotiated !== "ocpp1.6") {
-    console.warn(
-      `[WS] ${serialNumber} sem subprotocol ocpp1.6 negociado (negotiated="${negotiated}"). Encerrando.`
-    );
-    try {
-      ws.close(1002, "Subprotocol required: ocpp1.6");
-    } catch {}
+    console.warn(`[WS] ${serialNumber} sem subprotocol ocpp1.6 negociado. Encerrando.`);
+    try { ws.close(1002, "Subprotocol required: ocpp1.6"); } catch {}
     return;
   }
 
   clients.set(serialNumber, ws);
 
+  // TCP keepalive: ajuda em proxies/LBs que matam conexão ociosa (~30s)
+  try { ws._socket?.setKeepAlive(true, TCP_KEEPALIVE_MS); } catch {}
+
   // Keepalive ping (opcional)
   ws.isAlive = true;
   ws.on("pong", () => (ws.isAlive = true));
 
-  // avisa Base44 online (não bloqueia OCPP)
-  sendToBase44(serialNumber, msgStatus("Available", "WS Connected")).catch(
-    () => {}
-  );
+  // Enfileira comandos automáticos para disparar após BootNotification
+  enqueueAutoCommands(serialNumber);
 
-  // heartbeat “interno” pro Base44
+  // Base44 online (não bloqueia OCPP)
+  sendToBase44(serialNumber, msgStatus("Available", "WS Connected")).catch(() => {});
+
+  // Heartbeat “interno” pro Base44
   const t = setInterval(() => {
     const cur = clients.get(serialNumber);
     if (!cur || cur.readyState !== cur.OPEN) return;
@@ -283,9 +337,8 @@ wss.on("connection", (ws, req) => {
     const rawText = data.toString();
     let msg;
 
-    try {
-      msg = JSON.parse(rawText);
-    } catch {
+    try { msg = JSON.parse(rawText); }
+    catch {
       console.warn("[WS] JSON inválido:", rawText);
       return;
     }
@@ -297,9 +350,7 @@ wss.on("connection", (ws, req) => {
 
     if (!firstMsgAt) {
       firstMsgAt = Date.now();
-      console.log(
-        `[WS] primeira msg (${serialNumber}) -> type=${msg[0]} action=${msg[2] || ""}`
-      );
+      console.log(`[WS] primeira msg (${serialNumber}) -> type=${msg[0]} action=${msg[2] || ""}`);
     }
 
     const messageTypeId = msg[0];
@@ -310,71 +361,52 @@ wss.on("connection", (ws, req) => {
       const action = msg[2];
       const payload = msg[3] ?? {};
 
-      console.log(
-        `[OCPP IN] ${serialNumber} CALL action=${action} id=${messageId}`
-      );
+      console.log(`[OCPP IN] ${serialNumber} CALL action=${action} id=${messageId}`);
 
-      // 1) RESPONDE IMEDIATO (CRÍTICO)
+      // 1) RESPONDER IMEDIATO (CRÍTICO)
       const respPayload = buildImmediateCallResult(action, payload);
 
       if (respPayload === null) {
-        // melhor responder erro do que payload vazio inválido
-        const err = [
-          OCPP.CALLERROR,
-          messageId,
-          "NotImplemented",
-          `Action ${action} not supported`,
-          {},
-        ];
-        safeSend(ws, err);
-        console.log(
-          `[OCPP OUT] ${serialNumber} CALLERROR action=${action} id=${messageId} (NotImplemented)`
-        );
+        safeSend(ws, [OCPP.CALLERROR, messageId, "NotImplemented", `Action ${action} not supported`, {}]);
+        console.log(`[OCPP OUT] ${serialNumber} CALLERROR action=${action} id=${messageId} (NotImplemented)`);
       } else {
-        const ok = [OCPP.CALLRESULT, messageId, respPayload];
-        safeSend(ws, ok);
-        console.log(
-          `[OCPP OUT] ${serialNumber} CALLRESULT action=${action} id=${messageId}`
-        );
+        safeSend(ws, [OCPP.CALLRESULT, messageId, respPayload]);
+        console.log(`[OCPP OUT] ${serialNumber} CALLRESULT action=${action} id=${messageId}`);
       }
 
-      // 2) Depois encaminha pro Base44 (não bloqueia)
+      // 2) Depois encaminhar pro Base44
       sendToBase44(serialNumber, msg).catch(() => {});
+
+      // 3) Se foi BootNotification, dispare os comandos "logo ao conectar"
+      if (action === "BootNotification" && respPayload && respPayload.status === "Accepted") {
+        setTimeout(() => flushPendingCommands(serialNumber, ws), 200);
+      }
+
       return;
     }
 
     // ===== CP -> CSMS: CALLRESULT / CALLERROR =====
     if (messageTypeId === OCPP.CALLRESULT || messageTypeId === OCPP.CALLERROR) {
-      console.log(
-        `[OCPP IN] ${serialNumber} type=${messageTypeId} id=${msg[1]}`
-      );
+      console.log(`[OCPP IN] ${serialNumber} type=${messageTypeId} id=${msg[1]}`);
       sendToBase44(serialNumber, msg).catch(() => {});
       return;
     }
 
-    console.warn(
-      `[OCPP IN] ${serialNumber} tipo desconhecido:`,
-      messageTypeId,
-      msg
-    );
+    console.warn(`[OCPP IN] ${serialNumber} tipo desconhecido:`, messageTypeId, msg);
   });
 
   ws.on("close", (code, reasonBuf) => {
     const reason = (reasonBuf ? reasonBuf.toString() : "") || "";
-    console.log(
-      `[WS] close ${serialNumber} code=${code} reason="${reason}" at ${nowIso()}`
-    );
+    console.log(`[WS] close ${serialNumber} code=${code} reason="${reason}" at ${nowIso()}`);
 
     const it = base44Timers.get(serialNumber);
     if (it) clearInterval(it);
     base44Timers.delete(serialNumber);
 
     clients.delete(serialNumber);
+    pendingCommands.delete(serialNumber);
 
-    sendToBase44(
-      serialNumber,
-      msgStatus("Unavailable", `WS Close ${code}`)
-    ).catch(() => {});
+    sendToBase44(serialNumber, msgStatus("Unavailable", `WS Close ${code}`)).catch(() => {});
   });
 
   ws.on("error", (err) => {
@@ -387,19 +419,14 @@ if (ENABLE_PING) {
   setInterval(() => {
     for (const [serial, ws] of clients.entries()) {
       if (ws.isAlive === false) {
-        try {
-          ws.terminate();
-        } catch {}
+        try { ws.terminate(); } catch {}
         clients.delete(serial);
-        sendToBase44(serial, msgStatus("Unavailable", "Ping timeout")).catch(
-          () => {}
-        );
+        pendingCommands.delete(serial);
+        sendToBase44(serial, msgStatus("Unavailable", "Ping timeout")).catch(() => {});
         continue;
       }
       ws.isAlive = false;
-      try {
-        ws.ping();
-      } catch {}
+      try { ws.ping(); } catch {}
     }
   }, PING_INTERVAL_MS);
 }
@@ -409,4 +436,9 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log("BOOT_INTERVAL_SEC=" + BOOT_INTERVAL_SEC);
   console.log("BASE44_HEARTBEAT_SEC=" + BASE44_HEARTBEAT_SEC);
   console.log("ENABLE_PING=" + ENABLE_PING);
+  console.log("TCP_KEEPALIVE_MS=" + TCP_KEEPALIVE_MS);
+  console.log("AUTO_TRIGGER_STATUS=" + AUTO_TRIGGER_STATUS);
+  console.log("AUTO_TRIGGER_METER=" + AUTO_TRIGGER_METER);
+  console.log("AUTO_DATATRANSFER=" + AUTO_DATATRANSFER);
+  console.log("AUTO_RESERVE=" + AUTO_RESERVE);
 });
