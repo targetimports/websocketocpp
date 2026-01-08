@@ -157,25 +157,72 @@ function sendOcppCallToCharger(ws, serialNumber, action, payload = {}) {
 
 // HTTP server
 const server = http.createServer(async (req, res) => {
+
+  // ROOT
   if (req.method === "GET" && req.url === "/") {
     res.writeHead(200, { "Content-Type": "text/plain" });
     return res.end("OCPP 1.6J Gateway OK");
   }
 
+  // MONITOR
   if (req.method === "GET" && req.url === "/monitor") {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ ok: true, ts: nowIso() }));
   }
 
+  // CLIENTS
   if (req.method === "GET" && req.url === "/ocpp/clients") {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
       ok: true,
       clients: [...clients.keys()],
-      count: clients.size,
-      ts: nowIso(),
+      count: clients.size
     }));
   }
+
+  // 🔥 HEALTHCHECK POR CARREGADOR
+  if (req.method === "GET" && req.url.startsWith("/ocpp/health/")) {
+    const serialNumber = req.url.split("/").pop();
+
+    const ws = clients.get(serialNumber);
+    if (!ws || ws.readyState !== ws.OPEN) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({
+        serialNumber,
+        online: false,
+        reason: "ws_not_connected"
+      }));
+    }
+
+    try {
+      const messageId = uid();
+      const heartbeat = [OCPP.CALL, messageId, "Heartbeat", {}];
+
+      ws.send(JSON.stringify(heartbeat));
+
+      await waitForCallResult(messageId, 5000);
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({
+        serialNumber,
+        online: true,
+        checkedAt: nowIso()
+      }));
+    } catch {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({
+        serialNumber,
+        online: false,
+        reason: "no_heartbeat_response"
+      }));
+    }
+  }
+
+  // 🔴 404 SEMPRE POR ÚLTIMO
+  res.writeHead(404, { "Content-Type": "text/plain" });
+  res.end("not found");
+});
+
 
   // Base44 -> Node: enviar comando a qualquer momento
   if (req.method === "POST" && req.url === "/ocpp/send") {
