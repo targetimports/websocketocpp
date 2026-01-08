@@ -1,4 +1,4 @@
-```js
+
 // server.js (Node.js + ws) — OCPP 1.6J Gateway + Base44
 // - WebSocket: wss://HOST/{chargePointId}
 // - Healthcheck: GET /monitor
