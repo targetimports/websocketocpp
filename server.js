@@ -10,38 +10,23 @@ process.on("unhandledRejection", (err) => {
   console.error("UNHANDLED REJECTION:", err);
 });
 
-// Endpoint Base44 (ajuste se quiser)
+const PORT = process.env.PORT || 3000;
+
+// Base44 function endpoint
 const BASE44_URL =
   process.env.BASE44_URL ||
   "https://targetecomobi.base44.app/api/functions/processOcppMessage";
 
-// Timeout para chamadas ao Base44
 const BASE44_TIMEOUT_MS = Number(process.env.BASE44_TIMEOUT_MS || 8000);
 
-// Opcional: exigir subprotocol "ocpp1.6" (alguns carregadores pedem)
-const REQUIRE_OCPP_SUBPROTOCOL = String(process.env.REQUIRE_OCPP_SUBPROTOCOL || "false") === "true";
+// Se seu carregador exigir subprotocol "ocpp1.6", coloque true
+const REQUIRE_OCPP_SUBPROTOCOL =
+  String(process.env.REQUIRE_OCPP_SUBPROTOCOL || "false") === "true";
 
-// ---- Utilidades OCPP 1.6 ----
-const OCPP = {
-  CALL: 2,
-  CALLRESULT: 3,
-  CALLERROR: 4,
-};
+const OCPP = { CALL: 2, CALLRESULT: 3, CALLERROR: 4 };
 
 function nowIso() {
   return new Date().toISOString();
-}
-
-function randomId() {
-  return crypto.randomBytes(12).toString("hex");
-}
-
-function safeJsonParse(str) {
-  try {
-    return { ok: true, value: JSON.parse(str) };
-  } catch (e) {
-    return { ok: false, error: e };
-  }
 }
 
 function wsSendJson(ws, obj) {
@@ -52,25 +37,21 @@ function callError(messageId, errorCode, errorDescription, errorDetails = {}) {
   return [OCPP.CALLERROR, messageId, errorCode, errorDescription, errorDetails];
 }
 
-// Respostas padrão (você pode customizar para seu negócio)
+// Respostas padrão OCPP 1.6J (mínimo necessário para manter a sessão viva)
 function buildCallResult(action, payload) {
   switch (action) {
     case "BootNotification":
       return {
         status: "Accepted",
         currentTime: nowIso(),
-        interval: 300, // segundos
+        interval: 300,
       };
 
     case "Heartbeat":
       return { currentTime: nowIso() };
 
     case "Authorize":
-      return {
-        idTagInfo: {
-          status: "Accepted", // ou "Invalid" / "Blocked" etc
-        },
-      };
+      return { idTagInfo: { status: "Accepted" } };
 
     case "StartTransaction":
       return {
@@ -79,23 +60,25 @@ function buildCallResult(action, payload) {
       };
 
     case "StopTransaction":
-      return {
-        idTagInfo: { status: "Accepted" },
-      };
+      return { idTagInfo: { status: "Accepted" } };
 
-    case "StatusNotification":
-    case "MeterValues":
     case "DataTransfer":
+      return { status: "Accepted" };
+
+    // StatusNotification, MeterValues, DiagnosticsStatusNotification etc.
     default:
-      // A maioria pode responder {} e o carregador aceita
-      // Para DataTransfer, a spec permite status.
-      if (action === "DataTransfer") return { status: "Accepted" };
       return {};
   }
 }
 
-// Encaminha para Base44 com timeout e sem travar a resposta OCPP
-async function forwardToBase44({ chargePointId, raw, ocppType, messageId, action, payload }) {
+async function forwardToBase44({
+  chargePointId,
+  raw,
+  ocppType,
+  messageId,
+  action,
+  payload,
+}) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), BASE44_TIMEOUT_MS);
 
@@ -107,7 +90,7 @@ async function forwardToBase44({ chargePointId, raw, ocppType, messageId, action
       body: JSON.stringify({
         chargePointId,
         ocpp: {
-          ocppType,     // "CALL" | "CALLRESULT" | "CALLERROR"
+          ocppType, // CALL | CALLRESULT | CALLERROR
           messageId,
           action,
           payload,
@@ -117,9 +100,6 @@ async function forwardToBase44({ chargePointId, raw, ocppType, messageId, action
       }),
     });
 
-    // Se o Base44 retornar algo útil (ex: instrução para alterar resposta), você pode ler:
-    // const data = await res.json().catch(() => null);
-
     return { ok: res.ok, status: res.status };
   } catch (err) {
     return { ok: false, error: String(err?.message || err) };
@@ -128,92 +108,88 @@ async function forwardToBase44({ chargePointId, raw, ocppType, messageId, action
   }
 }
 
-// ---- HTTP server (healthcheck + info) ----
+// HTTP server (necessário no Railway p/ healthcheck e evitar 499)
 const server = http.createServer((req, res) => {
   if (req.url === "/monitor") {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ ok: true, ts: nowIso() }));
   }
+
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("OCPP 1.6J Gateway OK");
 });
 
-// ---- WebSocket server (OCPP) ----
+// WebSocket em cima do MESMO server (porta única do Railway)
 const wss = new WebSocketServer({
   server,
-  // Para aceitar o subprotocol ocpp1.6, se necessário:
-  handleProtocols: (protocols /* Set<string> */, request) => {
-    if (!protocols || protocols.size === 0) return false;
+  handleProtocols: (protocols) => {
+    // ws pode passar Set<string> (mais comum) ou array
+    const list = protocols instanceof Set ? [...protocols] : protocols || [];
 
-    if (protocols.has("ocpp1.6")) return "ocpp1.6";
+    // OCPP 1.6 JSON costuma usar "ocpp1.6"
+    if (list.includes("ocpp1.6")) return "ocpp1.6";
 
-    // Se você não quer exigir, pode aceitar o primeiro
-    if (!REQUIRE_OCPP_SUBPROTOCOL) {
-      return [...protocols][0];
-    }
-    return false;
+    // Se não exigir, aceita qualquer subprotocol enviado
+    if (!REQUIRE_OCPP_SUBPROTOCOL && list.length) return list[0];
+
+    // ⚠️ Em vez de false, use undefined (mais compatível)
+    return undefined;
   },
 });
 
 wss.on("connection", (ws, req) => {
-  // Ex: wss://host/CP_001 -> req.url = "/CP_001"
   const chargePointId = (req.url || "/").replace("/", "") || "UNKNOWN";
-
   console.log(`[WS] conectado: ${chargePointId}`);
 
-  ws.on("message", async (data) => {
-    const text = data.toString();
-
-    const parsed = safeJsonParse(text);
-    if (!parsed.ok) {
-      console.warn(`[WS] JSON inválido de ${chargePointId}:`, text);
-      // Sem messageId não dá pra responder CALLERROR corretamente
+  ws.on("message", (data) => {
+    let msg;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch {
+      console.warn(`[WS] JSON inválido ${chargePointId}:`, data.toString());
       return;
     }
 
-    const msg = parsed.value;
-
-    // OCPP 1.6 JSON é um array: [MessageTypeId, UniqueId, Action?, Payload?]
-    if (!Array.isArray(msg) || msg.length < 3) {
-      console.warn(`[WS] formato OCPP inválido de ${chargePointId}:`, msg);
+    // OCPP 1.6 JSON: [MessageTypeId, UniqueId, Action?, Payload?]
+    if (!Array.isArray(msg) || msg.length < 2) {
+      console.warn(`[WS] formato inválido ${chargePointId}:`, msg);
       return;
     }
 
     const messageTypeId = msg[0];
 
-    // ---- CALL (2) do carregador para o servidor ----
+    // ---------- CALL ----------
     if (messageTypeId === OCPP.CALL) {
       const messageId = msg[1];
       const action = msg[2];
       const payload = msg[3] ?? {};
 
-      // Responder rápido para não derrubar a sessão
+      // 1) Responder imediatamente para manter a sessão OCPP estável
       try {
         const responsePayload = buildCallResult(action, payload);
-        const callResult = [OCPP.CALLRESULT, messageId, responsePayload];
-        wsSendJson(ws, callResult);
-
-        // Envia para o Base44 em paralelo (não bloqueia)
-        forwardToBase44({
-          chargePointId,
-          raw: msg,
-          ocppType: "CALL",
-          messageId,
-          action,
-          payload,
-        }).then((r) => {
-          if (!r.ok) console.warn(`[Base44] falha (${chargePointId})`, r);
-        });
-
+        wsSendJson(ws, [OCPP.CALLRESULT, messageId, responsePayload]);
       } catch (err) {
-        console.error(`[WS] erro ao processar CALL ${action} (${chargePointId}):`, err);
-        wsSendJson(ws, callError(messageId, "InternalError", "Unhandled server error"));
+        console.error(`[WS] erro ao responder CALL (${chargePointId})`, err);
+        wsSendJson(ws, callError(messageId, "InternalError", "Server error"));
+        return;
       }
+
+      // 2) Encaminhar para Base44 sem bloquear o WebSocket
+      forwardToBase44({
+        chargePointId,
+        raw: msg,
+        ocppType: "CALL",
+        messageId,
+        action,
+        payload,
+      }).then((r) => {
+        if (!r.ok) console.warn(`[Base44] falha (${chargePointId})`, r);
+      });
 
       return;
     }
 
-    // ---- CALLRESULT (3) - resposta do carregador a um comando que o servidor enviou ----
+    // ---------- CALLRESULT ----------
     if (messageTypeId === OCPP.CALLRESULT) {
       const messageId = msg[1];
       const payload = msg[2] ?? {};
@@ -232,7 +208,7 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    // ---- CALLERROR (4) ----
+    // ---------- CALLERROR ----------
     if (messageTypeId === OCPP.CALLERROR) {
       const messageId = msg[1];
       const errorCode = msg[2];
