@@ -1,61 +1,59 @@
+```js
+// server.js (Node.js + ws) — OCPP 1.6J Gateway + Base44
+// - WebSocket: wss://HOST/{chargePointId}
+// - Healthcheck: GET /monitor
+// - Root: GET /
+// - List clients: GET /ocpp/clients
+// - Base44 -> Node send command: POST /ocpp/send (x-api-key opcional)
+// - Notifica Base44: CONNECTED / DISCONNECTED / HEARTBEAT / LASTSEEN
+
 import http from "node:http";
 import { WebSocketServer } from "ws";
 
+process.on("uncaughtException", (err) => console.error("UNCAUGHT EXCEPTION:", err));
+process.on("unhandledRejection", (err) => console.error("UNHANDLED REJECTION:", err));
+
 const PORT = process.env.PORT || 3000;
-const BASE44_URL = process.env.BASE44_URL; // seu function endpoint
-const API_KEY = process.env.API_KEY || ""; // opcional p/ proteger /ocpp/send
+
+// Base44 endpoints
+const BASE44_OCPP_URL =
+  process.env.BASE44_OCPP_URL ||
+  process.env.BASE44_URL || // compat
+  "https://targetecomobi.base44.app/api/functions/processOcppMessage";
+
+const BASE44_STATUS_URL =
+  process.env.BASE44_STATUS_URL || // opcional: se não definir, usa o OCPP_URL
+  BASE44_OCPP_URL;
+
+// Segurança para /ocpp/send
+const API_KEY = process.env.API_KEY || "";
+
+// Timeouts
+const BASE44_TIMEOUT_MS = Number(process.env.BASE44_TIMEOUT_MS || 8000);
+
+// Subprotocol OCPP
+const REQUIRE_OCPP_SUBPROTOCOL =
+  String(process.env.REQUIRE_OCPP_SUBPROTOCOL || "false") === "true";
+
+// Ping/pong
+const ENABLE_PING = String(process.env.ENABLE_PING || "true") === "true";
+const PING_INTERVAL_MS = Number(process.env.PING_INTERVAL_MS || 30000);
 
 const OCPP = { CALL: 2, CALLRESULT: 3, CALLERROR: 4 };
 
-const clients = new Map(); // chargePointId -> ws
-const pendingRequests = new Map(); // messageId -> { chargePointId, action, createdAt }
+// chargePointId -> ws
+const clients = new Map();
+// messageId -> { chargePointId, action, createdAt }
+const pendingRequests = new Map();
+// chargePointId -> timestamp lastSeen
+const lastSeen = new Map();
 
-function nowIso() { return new Date().toISOString(); }
-function uid() { return Math.random().toString(16).slice(2) + Date.now().toString(16); }
-
-async function postJson(url, body) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const text = await res.text();
-  let json = null;
-  try { json = JSON.parse(text); } catch {}
-  return { ok: res.ok, status: res.status, json, text };
+function nowIso() {
+  return new Date().toISOString();
 }
 
-function sendOcppCall(ws, chargePointId, action, payload) {
-  const messageId = uid();
-  const msg = [OCPP.CALL, messageId, action, payload ?? {}];
-  pendingRequests.set(messageId, { chargePointId, action, createdAt: Date.now() });
-  ws.send(JSON.stringify(msg));
-  return messageId;
-}
-
-async function handleIncomingCallFromCp({ chargePointId, ws, messageId, action, payload, raw }) {
-  // Pergunta ao Base44 qual resposta e quais comandos disparar
-  const r = await postJson(BASE44_URL, {
-    chargePointId,
-    direction: "FROM_CP",
-    type: "CALL",
-    messageId,
-    action,
-    payload,
-    raw,
-    receivedAt: nowIso(),
-  });
-
-  // Fallback se Base44 falhar
-  const callResult = (r.ok && r.json?.callResult) ? r.json.callResult : {};
-  ws.send(JSON.stringify([OCPP.CALLRESULT, messageId, callResult]));
-
-  // Comandos sugeridos pelo Base44
-  const commands = (r.ok && Array.isArray(r.json?.commands)) ? r.json.commands : [];
-  for (const cmd of commands) {
-    if (!cmd?.action) continue;
-    sendOcppCall(ws, chargePointId, cmd.action, cmd.payload || {});
-  }
+function uid() {
+  return Math.random().toString(16).slice(2) + Date.now().toString(16);
 }
 
 function readBody(req) {
@@ -66,34 +64,143 @@ function readBody(req) {
   });
 }
 
+async function postJson(url, body) {
+  if (!url) {
+    console.warn("[Base44] URL undefined. Pulando envio.");
+    return { ok: false, status: 0, json: null, text: "URL undefined" };
+  }
 
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), BASE44_TIMEOUT_MS);
 
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify(body),
+    });
 
+    const text = await res.text();
+    let json = null;
+    try {
+      json = JSON.parse(text);
+    } catch {}
+
+    return { ok: res.ok, status: res.status, json, text };
+  } catch (e) {
+    return { ok: false, status: 0, json: null, text: String(e?.message || e) };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// ---- Notificações “online/offline” para Base44 ----
+async function notifyBase44Status(type, chargePointId, extra = {}) {
+  lastSeen.set(chargePointId, Date.now());
+
+  const payload = {
+    type, // "CP_CONNECTED" | "CP_DISCONNECTED" | "CP_HEARTBEAT" | "CP_LASTSEEN"
+    chargePointId,
+    ts: nowIso(),
+    ...extra,
+  };
+
+  const r = await postJson(BASE44_STATUS_URL, payload);
+  if (!r.ok) console.warn("[Base44 status] falha:", r.status, r.text);
+}
+
+// ---- Forward OCPP para Base44 (mensagens) ----
+async function forwardOcppToBase44({ chargePointId, direction, ocppType, messageId, action, payload, raw, extra = {} }) {
+  lastSeen.set(chargePointId, Date.now());
+
+  const body = {
+    chargePointId,
+    direction, // "FROM_CP" | "FROM_SERVER"
+    type: ocppType, // "CALL" | "CALLRESULT" | "CALLERROR"
+    messageId,
+    action,
+    payload,
+    raw,
+    receivedAt: nowIso(),
+    ...extra,
+  };
+
+  const r = await postJson(BASE44_OCPP_URL, body);
+  if (!r.ok) console.warn("[Base44 ocpp] falha:", r.status, r.text);
+  return r; // pode conter callResult/commands se você quiser usar
+}
+
+// ---- Respostas padrão OCPP (fallback) ----
+function buildCallResultFallback(action) {
+  switch (action) {
+    case "BootNotification":
+      return { status: "Accepted", currentTime: nowIso(), interval: 300 };
+    case "Heartbeat":
+      return { currentTime: nowIso() };
+    case "Authorize":
+      return { idTagInfo: { status: "Accepted" } };
+    case "StartTransaction":
+      return {
+        transactionId: Math.floor(Math.random() * 1e9),
+        idTagInfo: { status: "Accepted" },
+      };
+    case "StopTransaction":
+      return { idTagInfo: { status: "Accepted" } };
+    case "DataTransfer":
+      return { status: "Accepted" };
+    default:
+      return {};
+  }
+}
+
+// ---- Enviar comando do servidor para o carregador (OCPP CALL) ----
+function sendOcppCall(ws, chargePointId, action, payload = {}) {
+  const messageId = uid();
+  const msg = [OCPP.CALL, messageId, action, payload];
+
+  pendingRequests.set(messageId, { chargePointId, action, createdAt: Date.now() });
+  ws.send(JSON.stringify(msg));
+
+  // opcional: registrar comando enviado ao Base44
+  forwardOcppToBase44({
+    chargePointId,
+    direction: "FROM_SERVER",
+    ocppType: "CALL",
+    messageId,
+    action,
+    payload,
+    raw: msg,
+  }).catch(() => {});
+
+  return messageId;
+}
+
+// ---- HTTP server ----
 const server = http.createServer(async (req, res) => {
-  // ✅ raiz (pra abrir no navegador sem 404)
+  // Root
   if (req.method === "GET" && req.url === "/") {
     res.writeHead(200, { "Content-Type": "text/plain" });
     return res.end("OCPP 1.6J Gateway OK");
   }
 
-  // ✅ healthcheck Railway
+  // Healthcheck
   if (req.method === "GET" && req.url === "/monitor") {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ ok: true, ts: nowIso() }));
   }
 
-  // (opcional) listar pontos conectados
+  // List online clients
   if (req.method === "GET" && req.url === "/ocpp/clients") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({
-      ok: true,
-      clients: [...clients.keys()],
-      count: clients.size,
-      ts: nowIso()
+    const list = [...clients.keys()].map((id) => ({
+      chargePointId: id,
+      lastSeenTs: lastSeen.get(id) || null,
     }));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: true, count: list.length, clients: list, ts: nowIso() }));
   }
 
-  // ✅ Base44 -> Node: enviar comando a qualquer momento
+  // Base44 -> Node send command
   if (req.method === "POST" && req.url === "/ocpp/send") {
     if (API_KEY && req.headers["x-api-key"] !== API_KEY) {
       res.writeHead(401);
@@ -121,7 +228,7 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ ok: false, error: "chargePoint offline" }));
     }
 
-    const messageId = sendOcppCall(ws, chargePointId, action, payload);
+    const messageId = sendOcppCall(ws, chargePointId, action, payload || {});
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ ok: true, messageId }));
   }
@@ -130,60 +237,175 @@ const server = http.createServer(async (req, res) => {
   res.end("not found");
 });
 
-
-const wss = new WebSocketServer({ server });
+// ---- WebSocket server ----
+const wss = new WebSocketServer({
+  server,
+  handleProtocols: (protocols) => {
+    const list = protocols instanceof Set ? [...protocols] : protocols || [];
+    if (list.includes("ocpp1.6")) return "ocpp1.6";
+    if (!REQUIRE_OCPP_SUBPROTOCOL && list.length) return list[0];
+    return undefined;
+  },
+});
 
 wss.on("connection", (ws, req) => {
   const chargePointId = (req.url || "/").replace("/", "") || "UNKNOWN";
   clients.set(chargePointId, ws);
+  lastSeen.set(chargePointId, Date.now());
+
+  ws.isAlive = true;
+  ws.on("pong", () => (ws.isAlive = true));
+
   console.log("[WS] conectado:", chargePointId);
+
+  // Notifica Base44: conectado/online
+  notifyBase44Status("CP_CONNECTED", chargePointId, {
+    ip: req.socket?.remoteAddress || null,
+    ua: req.headers["user-agent"] || null,
+  }).catch(() => {});
 
   ws.on("message", async (data) => {
     let msg;
-    try { msg = JSON.parse(data.toString()); } catch { return; }
-    if (!Array.isArray(msg) || msg.length < 2) return;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch {
+      console.warn("[WS] JSON inválido:", data.toString());
+      return;
+    }
 
-    const type = msg[0];
+    if (!Array.isArray(msg) || msg.length < 2) {
+      console.warn("[WS] formato inválido:", msg);
+      return;
+    }
 
-    // CP -> Server
-    if (type === OCPP.CALL) {
+    const messageTypeId = msg[0];
+
+    // ---------------- CP -> SERVER (CALL) ----------------
+    if (messageTypeId === OCPP.CALL) {
       const messageId = msg[1];
       const action = msg[2];
       const payload = msg[3] ?? {};
-      await handleIncomingCallFromCp({ chargePointId, ws, messageId, action, payload, raw: msg });
+
+      lastSeen.set(chargePointId, Date.now());
+
+      // Notifica Base44 “last seen”
+      notifyBase44Status("CP_LASTSEEN", chargePointId, { action }).catch(() => {});
+
+      // Se for Heartbeat, notificar explicitamente
+      if (action === "Heartbeat") {
+        notifyBase44Status("CP_HEARTBEAT", chargePointId).catch(() => {});
+      }
+
+      // 1) Você pode deixar o Base44 decidir a resposta:
+      // const r = await forwardOcppToBase44(...); const callResult = r.json?.callResult ?? fallback;
+      // 2) Ou responder rápido com fallback e apenas logar no Base44 (mais estável).
+      const callResult = buildCallResultFallback(action);
+      ws.send(JSON.stringify([OCPP.CALLRESULT, messageId, callResult]));
+
+      // Loga a mensagem no Base44 (sem bloquear a resposta OCPP)
+      forwardOcppToBase44({
+        chargePointId,
+        direction: "FROM_CP",
+        ocppType: "CALL",
+        messageId,
+        action,
+        payload,
+        raw: msg,
+      }).catch(() => {});
+
       return;
     }
 
-    // Resposta do CP a comandos do servidor
-    if (type === OCPP.CALLRESULT || type === OCPP.CALLERROR) {
+    // ---------------- CP -> SERVER (CALLRESULT) ----------------
+    if (messageTypeId === OCPP.CALLRESULT) {
       const messageId = msg[1];
+      const payload = msg[2] ?? {};
+
       const pending = pendingRequests.get(messageId);
       if (pending) pendingRequests.delete(messageId);
 
-      // Envia retorno ao Base44 (resultado do comando)
-      await postJson(BASE44_URL, {
+      lastSeen.set(chargePointId, Date.now());
+      notifyBase44Status("CP_LASTSEEN", chargePointId, { action: "CALLRESULT" }).catch(() => {});
+
+      // envia resultado ao Base44
+      forwardOcppToBase44({
         chargePointId,
         direction: "FROM_CP",
-        type: type === OCPP.CALLRESULT ? "CALLRESULT" : "CALLERROR",
+        ocppType: "CALLRESULT",
         messageId,
-        pendingAction: pending?.action || null,
-        payload: type === OCPP.CALLRESULT ? (msg[2] ?? {}) : {
-          errorCode: msg[2], errorDescription: msg[3], errorDetails: msg[4] ?? {}
-        },
+        action: pending?.action || null,
+        payload,
         raw: msg,
-        receivedAt: nowIso(),
-      });
+        extra: { pendingAction: pending?.action || null },
+      }).catch(() => {});
 
       return;
     }
+
+    // ---------------- CP -> SERVER (CALLERROR) ----------------
+    if (messageTypeId === OCPP.CALLERROR) {
+      const messageId = msg[1];
+      const errorCode = msg[2];
+      const errorDescription = msg[3];
+      const errorDetails = msg[4] ?? {};
+
+      const pending = pendingRequests.get(messageId);
+      if (pending) pendingRequests.delete(messageId);
+
+      lastSeen.set(chargePointId, Date.now());
+      notifyBase44Status("CP_LASTSEEN", chargePointId, { action: "CALLERROR" }).catch(() => {});
+
+      forwardOcppToBase44({
+        chargePointId,
+        direction: "FROM_CP",
+        ocppType: "CALLERROR",
+        messageId,
+        action: pending?.action || null,
+        payload: { errorCode, errorDescription, errorDetails },
+        raw: msg,
+        extra: { pendingAction: pending?.action || null },
+      }).catch(() => {});
+
+      return;
+    }
+
+    console.warn("[WS] MessageTypeId desconhecido:", msg);
   });
 
   ws.on("close", () => {
     clients.delete(chargePointId);
     console.log("[WS] desconectado:", chargePointId);
+
+    notifyBase44Status("CP_DISCONNECTED", chargePointId).catch(() => {});
+  });
+
+  ws.on("error", (err) => {
+    console.warn("[WS] erro:", chargePointId, err);
   });
 });
 
+// ---- Ping/pong watchdog (opcional) ----
+if (ENABLE_PING) {
+  setInterval(() => {
+    for (const [cpId, ws] of clients.entries()) {
+      if (ws.isAlive === false) {
+        try {
+          ws.terminate();
+        } catch {}
+        clients.delete(cpId);
+        notifyBase44Status("CP_DISCONNECTED", cpId, { reason: "ping_timeout" }).catch(() => {});
+        continue;
+      }
+      ws.isAlive = false;
+      try {
+        ws.ping();
+      } catch {}
+    }
+  }, PING_INTERVAL_MS);
+}
+
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`OCPP Gateway rodando na porta ${PORT}`);
+  console.log(`Healthcheck: /monitor`);
 });
+```
