@@ -1,7 +1,6 @@
 import http from "http";
 import { WebSocketServer } from "ws";
 import crypto from "crypto";
-import { fetch, AbortController } from "undici";
 
 process.on("uncaughtException", (err) => {
   console.error("UNCAUGHT EXCEPTION:", err);
@@ -10,6 +9,7 @@ process.on("uncaughtException", (err) => {
 process.on("unhandledRejection", (err) => {
   console.error("UNHANDLED REJECTION:", err);
 });
+
 // Endpoint Base44 (ajuste se quiser)
 const BASE44_URL =
   process.env.BASE44_URL ||
