@@ -1,4 +1,11 @@
-const PORT = Number(Deno.env.get("PORT") ?? "3000");
+import http from "node:http";
+import crypto from "node:crypto";
+import { WebSocketServer } from "ws";
+
+
+server.listen(PORT, "0.0.0.0");
+
+const PORT = process.env.PORT || 3000;
 
 const BASE44_URL =
   Deno.env.get("BASE44_URL") ??
