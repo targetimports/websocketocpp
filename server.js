@@ -157,6 +157,8 @@ wss.on("connection", (ws, req) => {
 
   const proto = req.headers["sec-websocket-protocol"] || "";
   console.log(`[WS] conectado ${serialNumber} | proto="${proto}" | path="${u.pathname}" | ${nowIso()}`);
+  console.log(`[WS] conectado ${serialNumber} | negotiated="${ws.protocol}" | header="${proto}" | path="${u.pathname}" | ${nowIso()}`);
+
 
   if (serialNumber === "UNKNOWN" || serialNumber === "monitor") {
     try { ws.close(); } catch {}
