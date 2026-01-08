@@ -1,7 +1,8 @@
+
 import http from "http";
 import { WebSocketServer } from "ws";
 import crypto from "crypto";
-
+import { fetch, AbortController } from "undici";
 const PORT = process.env.PORT || 3000;
 
 // Endpoint Base44 (ajuste se quiser)
