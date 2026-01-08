@@ -66,22 +66,55 @@ function readBody(req) {
   });
 }
 
+
+
+
 const server = http.createServer(async (req, res) => {
-  if (req.url === "/monitor") {
+  // ✅ raiz (pra abrir no navegador sem 404)
+  if (req.method === "GET" && req.url === "/") {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    return res.end("OCPP 1.6J Gateway OK");
+  }
+
+  // ✅ healthcheck Railway
+  if (req.method === "GET" && req.url === "/monitor") {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ ok: true, ts: nowIso() }));
   }
 
-  // Base44 -> Node: enviar comando a qualquer momento
+  // (opcional) listar pontos conectados
+  if (req.method === "GET" && req.url === "/ocpp/clients") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({
+      ok: true,
+      clients: [...clients.keys()],
+      count: clients.size,
+      ts: nowIso()
+    }));
+  }
+
+  // ✅ Base44 -> Node: enviar comando a qualquer momento
   if (req.method === "POST" && req.url === "/ocpp/send") {
     if (API_KEY && req.headers["x-api-key"] !== API_KEY) {
-      res.writeHead(401); return res.end("unauthorized");
+      res.writeHead(401);
+      return res.end("unauthorized");
     }
+
     const body = await readBody(req);
     let json;
-    try { json = JSON.parse(body); } catch { res.writeHead(400); return res.end("invalid json"); }
+    try {
+      json = JSON.parse(body);
+    } catch {
+      res.writeHead(400);
+      return res.end("invalid json");
+    }
 
     const { chargePointId, action, payload } = json || {};
+    if (!chargePointId || !action) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: "chargePointId and action are required" }));
+    }
+
     const ws = clients.get(chargePointId);
     if (!ws || ws.readyState !== ws.OPEN) {
       res.writeHead(404, { "Content-Type": "application/json" });
@@ -93,8 +126,10 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ ok: true, messageId }));
   }
 
-  res.writeHead(404); res.end("not found");
+  res.writeHead(404, { "Content-Type": "text/plain" });
+  res.end("not found");
 });
+
 
 const wss = new WebSocketServer({ server });
 
