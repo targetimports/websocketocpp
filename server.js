@@ -1,6 +1,3 @@
-// DENO server (Railway rodando como Deno)
-// OCPP 1.6J over WebSocket + healthcheck /monitor + forward to Base44
-
 const PORT = Number(Deno.env.get("PORT") ?? "3000");
 
 const BASE44_URL =
@@ -13,7 +10,7 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function buildCallResult(action, payload) {
+function buildCallResult(action) {
   switch (action) {
     case "BootNotification":
       return { status: "Accepted", currentTime: nowIso(), interval: 300 };
@@ -37,54 +34,35 @@ function buildCallResult(action, payload) {
 
 async function forwardToBase44({ chargePointId, raw, ocppType, messageId, action, payload }) {
   try {
-    const res = await fetch(BASE44_URL, {
+    await fetch(BASE44_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         chargePointId,
-        ocpp: {
-          ocppType,
-          messageId,
-          action,
-          payload,
-          raw,
-          receivedAt: nowIso(),
-        },
+        ocpp: { ocppType, messageId, action, payload, raw, receivedAt: nowIso() },
       }),
     });
-    if (!res.ok) {
-      console.warn("[Base44] status:", res.status);
-    }
   } catch (e) {
     console.warn("[Base44] erro:", String(e?.message || e));
   }
 }
 
-function jsonResponse(obj, status = 200) {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
 Deno.serve({ port: PORT, hostname: "0.0.0.0" }, (req) => {
   const url = new URL(req.url);
 
-  // Healthcheck Railway
   if (url.pathname === "/monitor") {
-    return jsonResponse({ ok: true, ts: nowIso() });
+    return new Response(JSON.stringify({ ok: true, ts: nowIso() }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
   }
 
-  // WebSocket upgrade
   const upgrade = req.headers.get("upgrade") || "";
   if (upgrade.toLowerCase() !== "websocket") {
     return new Response("OCPP 1.6J Gateway (Deno) OK", { status: 200 });
   }
 
-  // Aceita WebSocket
   const { socket, response } = Deno.upgradeWebSocket(req);
-
-  // chargePointId vem do path: /CP_123
   const chargePointId = (url.pathname || "/").replace("/", "") || "UNKNOWN";
   console.log("[WS] conectado:", chargePointId);
 
@@ -104,22 +82,16 @@ Deno.serve({ port: PORT, hostname: "0.0.0.0" }, (req) => {
 
     const messageTypeId = msg[0];
 
-    // CALL do carregador
     if (messageTypeId === OCPP.CALL) {
       const messageId = msg[1];
       const action = msg[2];
       const payload = msg[3] ?? {};
 
-      // Responder rápido
-      try {
-        const responsePayload = buildCallResult(action, payload);
-        socket.send(JSON.stringify([OCPP.CALLRESULT, messageId, responsePayload]));
-      } catch (e) {
-        socket.send(JSON.stringify([OCPP.CALLERROR, messageId, "InternalError", "Server error", {}]));
-        return;
-      }
+      // responder rápido
+      const respPayload = buildCallResult(action);
+      socket.send(JSON.stringify([OCPP.CALLRESULT, messageId, respPayload]));
 
-      // Enviar pro Base44 em paralelo
+      // enviar base44
       forwardToBase44({
         chargePointId,
         raw: msg,
@@ -128,47 +100,37 @@ Deno.serve({ port: PORT, hostname: "0.0.0.0" }, (req) => {
         action,
         payload,
       });
-
       return;
     }
 
-    // CALLRESULT (resposta do carregador)
     if (messageTypeId === OCPP.CALLRESULT) {
-      const messageId = msg[1];
-      const payload = msg[2] ?? {};
       forwardToBase44({
         chargePointId,
         raw: msg,
         ocppType: "CALLRESULT",
-        messageId,
+        messageId: msg[1],
         action: null,
-        payload,
+        payload: msg[2] ?? {},
       });
       return;
     }
 
-    // CALLERROR
     if (messageTypeId === OCPP.CALLERROR) {
-      const messageId = msg[1];
-      const errorCode = msg[2];
-      const errorDescription = msg[3];
-      const errorDetails = msg[4] ?? {};
       forwardToBase44({
         chargePointId,
         raw: msg,
         ocppType: "CALLERROR",
-        messageId,
+        messageId: msg[1],
         action: null,
-        payload: { errorCode, errorDescription, errorDetails },
+        payload: {
+          errorCode: msg[2],
+          errorDescription: msg[3],
+          errorDetails: msg[4] ?? {},
+        },
       });
       return;
     }
-
-    console.warn("[WS] MessageTypeId desconhecido:", msg);
   };
-
-  socket.onclose = () => console.log("[WS] desconectado:", chargePointId);
-  socket.onerror = (e) => console.warn("[WS] erro:", chargePointId, e);
 
   return response;
 });
