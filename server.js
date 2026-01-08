@@ -96,39 +96,24 @@ async function postJson(url, body) {
 }
 
 // ---- Notificações “online/offline” para Base44 ----
-async function notifyBase44Status(type, chargePointId, extra = {}) {
-  lastSeen.set(chargePointId, Date.now());
-
-  const payload = {
-    type, // "CP_CONNECTED" | "CP_DISCONNECTED" | "CP_HEARTBEAT" | "CP_LASTSEEN"
-    chargePointId,
-    ts: nowIso(),
-    ...extra,
-  };
-
-  const r = await postJson(BASE44_STATUS_URL, payload);
-  if (!r.ok) console.warn("[Base44 status] falha:", r.status, r.text);
+async function notifyBase44Status(event, serialNumber, extra = {}) {
+  return postJson(BASE44_OCPP_URL, {
+    serialNumber,
+    message: {
+      event,
+      ts: nowIso(),
+      ...extra
+    }
+  });
 }
 
 // ---- Forward OCPP para Base44 (mensagens) ----
-async function forwardOcppToBase44({ chargePointId, direction, ocppType, messageId, action, payload, raw, extra = {} }) {
-  lastSeen.set(chargePointId, Date.now());
-
-  const body = {
-    chargePointId,
-    direction, // "FROM_CP" | "FROM_SERVER"
-    type: ocppType, // "CALL" | "CALLRESULT" | "CALLERROR"
-    messageId,
-    action,
-    payload,
-    raw,
-    receivedAt: nowIso(),
-    ...extra,
-  };
-
-  const r = await postJson(BASE44_OCPP_URL, body);
-  if (!r.ok) console.warn("[Base44 ocpp] falha:", r.status, r.text);
-  return r; // pode conter callResult/commands se você quiser usar
+async function forwardOcppToBase44({ serialNumber, raw, messageType }) {
+  return postJson(BASE44_OCPP_URL, {
+    serialNumber,
+    message: raw,        // 🔥 manda o array OCPP completo
+    messageType          // opcional (se quiser logar)
+  });
 }
 
 // ---- Respostas padrão OCPP (fallback) ----
