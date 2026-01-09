@@ -301,12 +301,7 @@ wss.on("connection", (ws, req) => {
     return;
   }
 
-  // Exigir subprotocol em produção:
-  if (negotiated !== "ocpp1.6") {
-    console.warn(`[WS] ${serialNumber} sem subprotocol ocpp1.6 negociado. Encerrando.`);
-    try { ws.close(1002, "Subprotocol required: ocpp1.6"); } catch {}
-    return;
-  }
+
 
   clients.set(serialNumber, ws);
 
